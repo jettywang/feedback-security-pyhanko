@@ -185,6 +185,7 @@ class PdfFileReader(PdfHandler):
         stream,
         strict: bool = True,
         decode_limits: DecodeLimits | None = None,
+        require_pdf_mac: bool = False,
     ):
         """
         Initializes a PdfFileReader object.  This operation can take some time,
@@ -202,9 +203,22 @@ class PdfFileReader(PdfHandler):
             Pass :meth:`.DecodeLimits.for_trusted_input` to disable all limits.
 
             .. versionadded:: 0.38.0
+        :param require_pdf_mac:
+            Require encrypted documents to carry a valid PDF MAC
+            (ISO/TS 32004). If ``True``, a successful call to
+            :meth:`decrypt` or :meth:`decrypt_pubkey` will only report
+            a non-failed :class:`~.crypt.AuthStatus` if the document's
+            MAC could be validated; the MAC validation outcome is reported
+            separately in the returned :class:`~.crypt.AuthResult`.
+            Defaults to ``False``, which preserves the standard behaviour
+            (MACs are still validated whenever the document indicates
+            that one should be present).
+
+            .. versionadded:: 0.39.0
         """
         self._security_handler: SecurityHandler | None = None
         self.strict = strict
+        self._require_pdf_mac = require_pdf_mac
         stream.seek(0, os.SEEK_END)
         self._decode_context = DecodeContext(
             decode_limits or DecodeLimits(), input_size=stream.tell()
@@ -554,45 +568,80 @@ class PdfFileReader(PdfHandler):
         self.resolved_objects[(generation, idnum)] = obj
         return obj
 
+    @property
+    def _iso32004_extension_declared(self) -> bool:
+        """
+        Check whether the document catalog declares the ISO/TS 32004
+        developer extension (PDF MAC).
+        """
+        from pyhanko.pdf_utils.crypt.pdfmac import ISO32004
+
+        try:
+            exts = self.root['/Extensions']
+            iso_exts = exts.raw_get(ISO32004.prefix_name)
+        except (KeyError, AttributeError):
+            return False
+        if isinstance(iso_exts, generic.ArrayObject):
+            candidates = iso_exts
+        else:
+            candidates = (iso_exts,)
+        for ext in candidates:
+            try:
+                level = ext.get_object()['/ExtensionLevel']
+                if int(level) == ISO32004.extension_level:
+                    return True
+            except (KeyError, TypeError, ValueError, AttributeError):
+                continue
+        return False
+
     def _validate_pdf_mac(self, prelim_auth_result: AuthResult):
         sh = self.security_handler
         assert sh is not None
 
-        # TODO add MAC enforcement policy param
         # TODO forbid empty user pws (in the standard SH)
+        # A failed password/credential check is reported as-is; MAC
+        # validation only makes sense once we hold key material.
+        if prelim_auth_result.status == AuthStatus.FAILED:
+            return prelim_auth_result
+
         # Default strategy:
         # we ALWAYS enforce the MAC if the security handler says that support
         # is enabled (checked by presence of KDFSalt entry), or if there's
-        # an auth code entry in the trailer.
+        # an auth code entry in the trailer, or if the document declares
+        # the ISO/TS 32004 developer extension.
         # In addition, we cross-check against permission bit 13 (1-indexed)
         # returned by the security handler.
-        traces_of_mac = '/AuthCode' in self.trailer or sh.pdf_mac_enabled
+        # If the reader was created with require_pdf_mac=True, a valid MAC
+        # is required regardless of the above.
+        traces_of_mac = (
+            '/AuthCode' in self.trailer
+            or sh.pdf_mac_enabled
+            or self._iso32004_extension_declared
+        )
         perms = prelim_auth_result.permission_flags
         mac_required = perms is not None and perms.mac_required()
-        if prelim_auth_result.status != AuthStatus.FAILED and (
-            traces_of_mac or mac_required
-        ):
-            from pyhanko.pdf_utils.crypt import pdfmac
-
-            try:
-                pdfmac.validate_pdf_mac(self)
-                auth_result = AuthResult(
-                    status=prelim_auth_result.status,
-                    permission_flags=prelim_auth_result.permission_flags,
-                    mac_status=PdfMacStatus.SUCCESSFUL,
-                )
-            except pdfmac.PdfMacValidationError as e:
-                logger.warning(
-                    f"Failed to validate MAC: {e.failure_message}", exc_info=e
-                )
-                auth_result = AuthResult(
-                    status=AuthStatus.FAILED,
-                    mac_status=PdfMacStatus.FAILED,
-                    mac_failure_reason=e.failure_message,
-                )
-            return auth_result
-        else:
+        if not (traces_of_mac or mac_required or self._require_pdf_mac):
             return prelim_auth_result
+
+        from pyhanko.pdf_utils.crypt import pdfmac
+
+        try:
+            pdfmac.validate_pdf_mac(self)
+            auth_result = AuthResult(
+                status=prelim_auth_result.status,
+                permission_flags=prelim_auth_result.permission_flags,
+                mac_status=PdfMacStatus.SUCCESSFUL,
+            )
+        except pdfmac.PdfMacValidationError as e:
+            logger.warning(
+                f"Failed to validate MAC: {e.failure_message}", exc_info=e
+            )
+            auth_result = AuthResult(
+                status=AuthStatus.FAILED,
+                mac_status=PdfMacStatus.FAILED,
+                mac_failure_reason=e.failure_message,
+            )
+        return auth_result
 
     def decrypt(self, password: str | bytes) -> AuthResult:
         """

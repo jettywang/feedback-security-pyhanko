@@ -21,8 +21,10 @@ from asn1crypto import cms, core
 from freezegun import freeze_time
 from pyhanko.pdf_utils import generic, writer
 from pyhanko.pdf_utils.crypt import (
+    AuthStatus,
     PubKeySecurityHandler,
     StandardSecurityHandler,
+    StandardSecuritySettingsRevision,
     pdfmac,
 )
 from pyhanko.pdf_utils.crypt.api import PdfMacStatus
@@ -199,7 +201,7 @@ class EncryptionType(enum.Enum):
 
 
 def init_sample_doc(
-    encryption_type: EncryptionType,
+    encryption_type: EncryptionType | None,
     writer_class: type[PdfFileWriter] = PdfFileWriter,
 ):
     w = writer_class(stream_xrefs=False)
@@ -232,7 +234,7 @@ def init_sample_doc(
             [PUBKEY_TEST_DECRYPTER.cert], compat_entries=False
         )
         w._assign_security_handler(sh)
-    else:
+    elif encryption_type == EncryptionType.STANDARD:
         w.encrypt(DUMMY_PASSWORD, compat_entries=False)
     return w
 
@@ -1268,3 +1270,165 @@ async def test_sign_cannot_reuse_pdf_signer_with_macs_in_parallel():
         await asyncio.gather(
             pdf_signer.async_sign_pdf(w1), pdf_signer.async_sign_pdf(w2)
         )
+
+
+# -------- Enforcement policy: require_pdf_mac --------
+
+
+def _init_legacy_sample_doc():
+    """
+    Small sample document with legitimate legacy (pre-PDF 2.0) encryption,
+    which by definition cannot carry a PDF MAC.
+    """
+    w = init_sample_doc(None)
+    sh = StandardSecurityHandler.build_from_pw_legacy(
+        StandardSecuritySettingsRevision.RC4_OR_AES128,
+        w._document_id[0].original_bytes,
+        "ownersecret",
+        "usersecret",
+        keylen_bytes=16,
+        use_aes128=True,
+    )
+    w._assign_security_handler(sh)
+    return w
+
+
+def test_require_pdf_mac_standalone():
+    w = init_sample_doc(EncryptionType.STANDARD)
+    out = BytesIO()
+    w.write(out)
+
+    r = PdfFileReader(out, require_pdf_mac=True)
+    result = r.decrypt(DUMMY_PASSWORD)
+    assert result.status != AuthStatus.FAILED
+    assert result.mac_status == PdfMacStatus.SUCCESSFUL
+
+
+@freeze_time('2020-11-01')
+def test_require_pdf_mac_attached_to_sig():
+    w = init_sample_doc(EncryptionType.STANDARD)
+    signer = SimpleSigner(
+        signing_cert=FROM_ECC_CA.signing_cert,
+        signing_key=FROM_ECC_CA.signing_key,
+        cert_registry=FROM_ECC_CA.cert_registry,
+    )
+    out = signers.sign_pdf(
+        w,
+        signers.PdfSignatureMetadata(field_name='Sig'),
+        signer=signer,
+    )
+
+    r = PdfFileReader(out, require_pdf_mac=True)
+    result = r.decrypt(DUMMY_PASSWORD)
+    assert result.status != AuthStatus.FAILED
+    assert result.mac_status == PdfMacStatus.SUCCESSFUL
+
+
+def test_require_pdf_mac_legacy_encryption_without_mac():
+    w = _init_legacy_sample_doc()
+    out = BytesIO()
+    w.write(out)
+
+    # default behaviour: legacy encryption without a MAC is still
+    # readable without any MAC-related checks
+    r = PdfFileReader(BytesIO(out.getvalue()))
+    result = r.decrypt("usersecret")
+    assert result.status == AuthStatus.USER
+    assert result.mac_status == PdfMacStatus.NOT_APPLICABLE
+
+    # with the enforcement policy enabled, the missing MAC is flagged
+    r = PdfFileReader(BytesIO(out.getvalue()), require_pdf_mac=True)
+    result = r.decrypt("usersecret")
+    assert result.status == AuthStatus.FAILED
+    assert result.mac_status == PdfMacStatus.FAILED
+    assert "Failed to locate AuthCode" in result.mac_failure_reason
+
+
+@pytest.mark.parametrize('require_pdf_mac', [False, True])
+def test_extension_declared_but_auth_data_missing(require_pdf_mac):
+    # Document declares the ISO/TS 32004 developer extension, but contains
+    # no authentication data whatsoever (no /AuthCode, no /KDFSalt, and
+    # permissions that tolerate a missing MAC).
+
+    class Writer(PdfFileWriter):
+        def write(self, stream):
+            # declare the ISO/TS 32004 extension, but skip writing the MAC
+            self.register_extension(pdfmac.ISO32004)
+            self._write(stream)
+
+    w = init_sample_doc(None, writer_class=Writer)
+    w.encrypt(DUMMY_PASSWORD, compat_entries=False, pdf_mac=False)
+    out = BytesIO()
+    w.write(out)
+
+    r = PdfFileReader(out, require_pdf_mac=require_pdf_mac)
+    result = r.decrypt(DUMMY_PASSWORD)
+    assert result.status == AuthStatus.FAILED
+    assert result.mac_status == PdfMacStatus.FAILED
+    assert "Failed to locate AuthCode" in result.mac_failure_reason
+
+
+@freeze_time('2020-11-01')
+def test_require_pdf_mac_with_mac_aware_incremental_update():
+    # incremental update that refreshes the MAC -> still valid
+    w = init_sample_doc(EncryptionType.STANDARD)
+    out = BytesIO()
+    w.write(out)
+
+    w = IncrementalPdfFileWriter(out)
+    w.encrypt(DUMMY_PASSWORD)
+    PdfTimeStamper(timestamper=DUMMY_TS).timestamp_pdf(
+        w, md_algorithm='sha256', in_place=True
+    )
+
+    r = PdfFileReader(out, require_pdf_mac=True)
+    result = r.decrypt(DUMMY_PASSWORD)
+    assert result.status != AuthStatus.FAILED
+    assert result.mac_status == PdfMacStatus.SUCCESSFUL
+    assert r.total_revisions == 2
+
+
+def test_require_pdf_mac_with_unauthenticated_incremental_update():
+    # incremental update appended without refreshing the MAC -> rejected
+    w = init_sample_doc(EncryptionType.STANDARD)
+    out = BytesIO()
+    w.write(out)
+
+    r = PdfFileReader(out)
+    _dummy_decrypt(r, ignore_mac=True)
+    w = IncrementalPdfFileWriter.from_reader(r)
+    # short-circuit MAC
+    w.digest_aware_write = True
+    w.root['/Foo'] = generic.pdf_name('/Bar')
+    w.update_root()
+    w.write_in_place()
+
+    r = PdfFileReader(out, require_pdf_mac=True)
+    result = r.decrypt(DUMMY_PASSWORD)
+    assert result.status == AuthStatus.FAILED
+    assert result.mac_status == PdfMacStatus.FAILED
+    assert "/ByteRange covering the entire file" in result.mac_failure_reason
+
+
+def test_password_and_mac_failures_reported_separately():
+    w = init_sample_doc(EncryptionType.STANDARD)
+    out = BytesIO()
+    w.write(out)
+    # tamper with the file: this is in the middle of the second line
+    # of the header, so the file remains readable
+    out.seek(10)
+    out.write(b'\x01')
+    tampered = out.getvalue()
+
+    # correct password, but invalid MAC -> integrity problem
+    r = PdfFileReader(BytesIO(tampered), require_pdf_mac=True)
+    result = r.decrypt(DUMMY_PASSWORD)
+    assert result.mac_status == PdfMacStatus.FAILED
+    assert "Document digest does not match" in result.mac_failure_reason
+
+    # wrong password -> password problem, MAC check not applicable
+    r = PdfFileReader(BytesIO(tampered), require_pdf_mac=True)
+    result = r.decrypt("not the password")
+    assert result.status == AuthStatus.FAILED
+    assert result.mac_status == PdfMacStatus.NOT_APPLICABLE
+    assert result.mac_failure_reason is None

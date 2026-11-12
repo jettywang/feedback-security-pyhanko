@@ -6,6 +6,32 @@ Release history
 pyHanko
 -------
 
+.. _release-0.39.0:
+
+0.39.0
+======
+
+*Release date:* TBD
+
+
+New features and enhancements
+-----------------------------
+
+Reading
+^^^^^^^
+
+ * Add ``require_pdf_mac`` keyword argument to
+   :class:`~pyhanko.pdf_utils.reader.PdfFileReader`, allowing callers to
+   require a valid ISO/TS 32004 PDF MAC on encrypted documents before
+   relying on decrypted objects. The MAC validation outcome is reported
+   separately from password authentication in
+   :class:`~pyhanko.pdf_utils.crypt.api.AuthResult`, so integrity problems
+   can be told apart from credential problems.
+ * Documents that declare the ISO/TS 32004 developer extension but do not
+   contain any authentication data are now also flagged when decrypting,
+   even without the new enforcement option.
+
+
 .. _release-0.38.1:
 
 0.38.1
