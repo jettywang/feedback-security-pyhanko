@@ -8,6 +8,7 @@ from pyhanko.pdf_utils.incremental_writer import IncrementalPdfFileWriter
 from pyhanko.pdf_utils.reader import PdfFileReader
 from pyhanko.pdf_utils.writer import copy_into_new_writer
 from pyhanko.sign import signers
+from pyhanko.sign.general import SigningError
 from pyhanko.sign.diff_analysis import ModificationLevel
 from pyhanko.sign.signers.pdf_signer import (
     DSSContentSettings,
@@ -278,3 +279,23 @@ def test_copy_file_with_mdp_signature_and_backref():
     s.compute_integrity_info()
     status = validate_pdf_signature(s, simple_v_context(), skip_diff=True)
     assert not status.intact
+
+
+@freeze_time('2020-11-01')
+@pytest.mark.parametrize('password', ['usersecret', 'ownersecret'])
+def test_sign_crypt_in_place_failure_rolls_back(password):
+    # if in-place signing of an encrypted file fails after the placeholder
+    # revision was appended, the source stream must remain untouched
+    buf = BytesIO(MINIMAL_ONE_FIELD_AES256)
+    w = IncrementalPdfFileWriter(buf)
+    w.encrypt(password)
+    with pytest.raises(SigningError, match='larger than expected'):
+        signers.sign_pdf(
+            w,
+            signers.PdfSignatureMetadata(field_name='Sig1'),
+            signer=FROM_CA,
+            existing_fields_only=True,
+            bytes_reserved=64,
+            in_place=True,
+        )
+    assert buf.getvalue() == MINIMAL_ONE_FIELD_AES256

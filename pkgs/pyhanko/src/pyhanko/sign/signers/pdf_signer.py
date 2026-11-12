@@ -3,9 +3,11 @@ This module implements support for PDF-specific signing functionality.
 """
 
 import asyncio
+import contextlib
 import enum
 import itertools
 import logging
+import os
 import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -90,6 +92,37 @@ from ...pdf_utils.crypt import SerialisedCredential
 from ..attributes import CMSAttributeProvider
 
 logger = logging.getLogger(__name__)
+
+
+@contextlib.contextmanager
+def _rollback_in_place_writes(pdf_out: BasePdfFileWriter, in_place: bool):
+    # Internal helper to make in-place signing operations all-or-nothing:
+    # if anything fails after the placeholder revision was appended to the
+    # source stream, truncate the stream back to its original length so the
+    # input file is not left with a dangling half-written revision.
+    stream = None
+    original_len = None
+    if in_place and isinstance(pdf_out, IncrementalPdfFileWriter):
+        stream = pdf_out.prev.stream
+        try:
+            pos = stream.tell()
+            stream.seek(0, os.SEEK_END)
+            original_len = stream.tell()
+            stream.seek(pos)
+        except (OSError, ValueError):
+            stream = None
+    try:
+        yield
+    except Exception:
+        if stream is not None and original_len is not None:
+            try:
+                stream.truncate(original_len)
+            except (OSError, ValueError):
+                logger.warning(
+                    "Failed to roll back incomplete in-place update",
+                    exc_info=True,
+                )
+        raise
 
 
 @dataclass(frozen=True)
@@ -820,46 +853,50 @@ class PdfTimeStamper:
             output=output,
             chunk_size=chunk_size,
         )
-        prep_digest: PreparedByteRangeDigest
-        prep_digest, res_output = cms_writer.send(sig_io)
-        timestamp_cms = await timestamper.async_timestamp(
-            prep_digest.document_digest, md_algorithm
-        )
-        if need_mac:
-            add_mac_to_external_cms(
-                pdf_out,
-                md_algorithm=md_algorithm,
-                signed_data=timestamp_cms['content'],
-                document_digest=prep_digest.document_digest,
+        with _rollback_in_place_writes(pdf_out, in_place):
+            prep_digest: PreparedByteRangeDigest
+            prep_digest, res_output = cms_writer.send(sig_io)
+            timestamp_cms = await timestamper.async_timestamp(
+                prep_digest.document_digest, md_algorithm
             )
-        sig_contents = cms_writer.send(timestamp_cms)
+            if need_mac:
+                add_mac_to_external_cms(
+                    pdf_out,
+                    md_algorithm=md_algorithm,
+                    signed_data=timestamp_cms['content'],
+                    document_digest=prep_digest.document_digest,
+                )
+            sig_contents = cms_writer.send(timestamp_cms)
 
-        # update the DSS if necessary
-        if validation_context is not None and not dss_settings.update_before_ts:
-            if not dss_settings.include_vri:
-                sig_contents = None
+            # update the DSS if necessary
+            if (
+                validation_context is not None
+                and not dss_settings.update_before_ts
+            ):
+                if not dss_settings.include_vri:
+                    sig_contents = None
 
-            # FIXME in this case, the ser/deser step is unnecessary
-            #  and inefficient; should probably rewrite
-            #  using supply_dss_in_writer
-            credential_ser: SerialisedCredential | None = None
-            if pdf_out.security_handler:
-                credential = pdf_out.security_handler.extract_credential()
-                if credential:
-                    credential_ser = credential.serialise()
-            strict = True
-            if isinstance(pdf_out, IncrementalPdfFileWriter):
-                strict = pdf_out.prev.strict
-            validation.DocumentSecurityStore.add_dss(
-                output_stream=res_output,
-                sig_contents=sig_contents,
-                paths=validation_paths,
-                validation_context=validation_context,
-                force_write=not dss_settings.skip_if_unneeded,
-                embed_roots=embed_roots,
-                file_credential=credential_ser,
-                strict=strict,
-            )
+                # FIXME in this case, the ser/deser step is unnecessary
+                #  and inefficient; should probably rewrite
+                #  using supply_dss_in_writer
+                credential_ser: SerialisedCredential | None = None
+                if pdf_out.security_handler:
+                    credential = pdf_out.security_handler.extract_credential()
+                    if credential:
+                        credential_ser = credential.serialise()
+                strict = True
+                if isinstance(pdf_out, IncrementalPdfFileWriter):
+                    strict = pdf_out.prev.strict
+                validation.DocumentSecurityStore.add_dss(
+                    output_stream=res_output,
+                    sig_contents=sig_contents,
+                    paths=validation_paths,
+                    validation_context=validation_context,
+                    force_write=not dss_settings.skip_if_unneeded,
+                    embed_roots=embed_roots,
+                    file_credential=credential_ser,
+                    strict=strict,
+                )
 
         return misc.finalise_output(output, res_output)
 
@@ -1404,9 +1441,10 @@ class PdfSigner:
             bytes_reserved=bytes_reserved,
             appearance_text_params=appearance_text_params,
         )
-        prepared_br_digest, res_output = tbs_document.digest_tbs_document(
-            in_place=in_place, chunk_size=chunk_size, output=output
-        )
+        with _rollback_in_place_writes(pdf_out, in_place):
+            prepared_br_digest, res_output = tbs_document.digest_tbs_document(
+                in_place=in_place, chunk_size=chunk_size, output=output
+            )
         return (
             prepared_br_digest,
             tbs_document,
@@ -1536,26 +1574,29 @@ class PdfSigner:
             bytes_reserved=bytes_reserved,
             appearance_text_params=appearance_text_params,
         )
-        prepared_br_digest, res_output = tbs_document.digest_tbs_document(
-            in_place=in_place, chunk_size=chunk_size, output=output
-        )
+        with _rollback_in_place_writes(pdf_out, in_place):
+            prepared_br_digest, res_output = tbs_document.digest_tbs_document(
+                in_place=in_place, chunk_size=chunk_size, output=output
+            )
 
-        post_signing_doc = await tbs_document.perform_signature(
-            document_digest=prepared_br_digest.document_digest,
-            pdf_cms_signed_attrs=PdfCMSSignedAttributes(
-                signing_time=signing_session.system_time,
-                adobe_revinfo_attr=(
-                    None
-                    if validation_info is None
-                    else validation_info.adobe_revinfo_attr
+            post_signing_doc = await tbs_document.perform_signature(
+                document_digest=prepared_br_digest.document_digest,
+                pdf_cms_signed_attrs=PdfCMSSignedAttributes(
+                    signing_time=signing_session.system_time,
+                    adobe_revinfo_attr=(
+                        None
+                        if validation_info is None
+                        else validation_info.adobe_revinfo_attr
+                    ),
+                    cades_signed_attrs=(
+                        self.signature_meta.cades_signed_attr_spec
+                    ),
                 ),
-                cades_signed_attrs=self.signature_meta.cades_signed_attr_spec,
-            ),
-        )
+            )
 
-        await post_signing_doc.post_signature_processing(
-            res_output, chunk_size=chunk_size
-        )
+            await post_signing_doc.post_signature_processing(
+                res_output, chunk_size=chunk_size
+            )
         # we put the finalisation step after the DSS manipulations, since
         # otherwise we'd also run into issues with non-seekable output buffers
         return misc.finalise_output(output, res_output)

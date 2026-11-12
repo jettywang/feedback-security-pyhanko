@@ -1836,3 +1836,51 @@ def test_sign_visible_with_separate_annot(presign_ap):
     assert '/AP' in emb.sig_field['/Kids'][0]
     assert b'Digitally signed' in emb.sig_field['/Kids'][0]['/AP']['/N'].data
     val_trusted(emb)
+
+
+@freeze_time('2020-11-01')
+def test_sign_pdf_in_place_failure_rolls_back():
+    # if signing fails after the placeholder revision was appended to the
+    # source stream, the stream must be rolled back to its original state
+    buf = BytesIO(MINIMAL_ONE_FIELD)
+    w = IncrementalPdfFileWriter(buf)
+    meta = signers.PdfSignatureMetadata(field_name='Sig1')
+    signer = signers.PdfSigner(meta, signer=FROM_CA)
+    with pytest.raises(SigningError, match='larger than expected'):
+        signer.sign_pdf(
+            w, existing_fields_only=True, bytes_reserved=64, in_place=True
+        )
+    assert buf.getvalue() == MINIMAL_ONE_FIELD
+
+
+@freeze_time('2020-11-01')
+def test_sign_pdf_in_place_signer_error_rolls_back():
+    # same, but with the failure happening in the signing step itself
+    buf = BytesIO(MINIMAL_ONE_FIELD)
+    w = IncrementalPdfFileWriter(buf)
+    meta = signers.PdfSignatureMetadata(field_name='Sig1')
+    signer = signers.PdfSigner(meta, signer=FROM_CA)
+
+    async def fail_sign(*_args, **_kwargs):
+        raise SigningError('simulated signer failure')
+
+    orig_async_sign = FROM_CA.async_sign
+    FROM_CA.async_sign = fail_sign
+    try:
+        with pytest.raises(SigningError, match='simulated signer failure'):
+            signer.sign_pdf(w, existing_fields_only=True, in_place=True)
+    finally:
+        FROM_CA.async_sign = orig_async_sign
+    assert buf.getvalue() == MINIMAL_ONE_FIELD
+
+
+@freeze_time('2020-11-01')
+def test_timestamp_pdf_in_place_failure_rolls_back():
+    buf = BytesIO(MINIMAL_ONE_FIELD)
+    w = IncrementalPdfFileWriter(buf)
+    timestamper = signers.PdfTimeStamper(DUMMY_TS)
+    with pytest.raises(SigningError, match='larger than expected'):
+        timestamper.timestamp_pdf(
+            w, 'sha256', bytes_reserved=64, in_place=True
+        )
+    assert buf.getvalue() == MINIMAL_ONE_FIELD
