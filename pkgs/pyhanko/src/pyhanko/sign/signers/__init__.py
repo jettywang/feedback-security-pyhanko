@@ -17,7 +17,10 @@ from .pdf_byterange import (
     DocumentTimestamp,
     PdfByteRangeDigest,
     PdfSignedData,
+    PlaceholderAlreadyFilledError,
+    PreparedDocumentMismatchError,
     SignatureObject,
+    SignatureTooLargeError,
 )
 from .pdf_cms import ExternalSigner, Signer, SimpleSigner
 from .pdf_signer import PdfSignatureMetadata, PdfSigner, PdfTimeStamper
@@ -34,7 +37,10 @@ __all__ = [
     'PdfSignedData',
     'PdfSigner',
     'PdfTimeStamper',
+    'PlaceholderAlreadyFilledError',
+    'PreparedDocumentMismatchError',
     'SignatureObject',
+    'SignatureTooLargeError',
     'Signer',
     'SimpleSigner',
     'async_sign_pdf',

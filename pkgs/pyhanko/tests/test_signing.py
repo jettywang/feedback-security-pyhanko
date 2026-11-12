@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import os
+import pickle
 from datetime import datetime
 from io import BytesIO
 
@@ -25,7 +26,12 @@ from pyhanko.sign.diff_analysis import (
 )
 from pyhanko.sign.general import SigningError, find_unique_cms_attribute
 from pyhanko.sign.signers import cms_embedder
-from pyhanko.sign.signers.pdf_byterange import BuildProps
+from pyhanko.sign.signers.pdf_byterange import (
+    BuildProps,
+    PlaceholderAlreadyFilledError,
+    PreparedDocumentMismatchError,
+    SignatureTooLargeError,
+)
 from pyhanko.sign.signers.pdf_cms import (
     ExternalSigner,
     PdfCMSSignedAttributes,
@@ -1203,6 +1209,133 @@ async def test_interrupted_with_delayed_signing_cert_directly_specify_md():
 
     r = PdfFileReader(output)
     await async_val_trusted(r.embedded_signatures[0])
+
+
+async def _prepare_interrupted(data: bytes, field_name='SigNew'):
+    w = IncrementalPdfFileWriter(BytesIO(data))
+    pdf_signer = signers.PdfSigner(
+        signers.PdfSignatureMetadata(field_name=field_name), signer=FROM_CA
+    )
+    return await pdf_signer.async_digest_doc_for_signing(
+        w, bytes_reserved=8192
+    )
+
+
+@freeze_time('2020-11-01')
+@pytest.mark.asyncio
+async def test_interrupted_signature_crossed_prepared_documents():
+    # two documents of identical length but different content
+    doc_a = MINIMAL.replace(b'(Hello World)', b'(Hello Brave)')
+    doc_b = MINIMAL.replace(b'(Hello World)', b'(Hello There)')
+    assert len(doc_a) == len(doc_b) == len(MINIMAL)
+
+    prep_a, tbs_a, output_a = await _prepare_interrupted(doc_a)
+    prep_b, tbs_b, output_b = await _prepare_interrupted(doc_b)
+    assert len(output_a.getvalue()) == len(output_b.getvalue())
+
+    cms_a = await FROM_CA.async_sign(
+        prep_a.document_digest, digest_algorithm=tbs_a.md_algorithm
+    )
+    cms_b = await FROM_CA.async_sign(
+        prep_b.document_digest, digest_algorithm=tbs_b.md_algorithm
+    )
+
+    # cross the streams: prepared state of one document must not be
+    # applicable to the output of the other
+    snapshot_a = output_a.getvalue()
+    snapshot_b = output_b.getvalue()
+    with pytest.raises(PreparedDocumentMismatchError, match='does not match'):
+        await PdfTBSDocument.async_finish_signing(output_a, prep_b, cms_b)
+    with pytest.raises(PreparedDocumentMismatchError, match='does not match'):
+        await PdfTBSDocument.async_finish_signing(output_b, prep_a, cms_a)
+    # failed attempts must not modify the prepared output
+    assert output_a.getvalue() == snapshot_a
+    assert output_b.getvalue() == snapshot_b
+
+    # ...but matching pairs still work
+    await PdfTBSDocument.async_finish_signing(output_a, prep_a, cms_a)
+    await PdfTBSDocument.async_finish_signing(output_b, prep_b, cms_b)
+    await async_val_trusted(PdfFileReader(output_a).embedded_signatures[0])
+    await async_val_trusted(PdfFileReader(output_b).embedded_signatures[0])
+
+
+@freeze_time('2020-11-01')
+@pytest.mark.asyncio
+async def test_interrupted_signature_detects_modified_output():
+    prep_digest, tbs_document, output = await _prepare_interrupted(MINIMAL)
+    cms_obj = await FROM_CA.async_sign(
+        prep_digest.document_digest,
+        digest_algorithm=tbs_document.md_algorithm,
+    )
+
+    # tamper with a byte outside the reserved region
+    tampered = bytearray(output.getvalue())
+    tampered[100] ^= 0x01
+    tampered_output = BytesIO(bytes(tampered))
+    snapshot = tampered_output.getvalue()
+    with pytest.raises(PreparedDocumentMismatchError, match='does not match'):
+        await PdfTBSDocument.async_finish_signing(
+            tampered_output, prep_digest, cms_obj
+        )
+    assert tampered_output.getvalue() == snapshot
+
+
+@freeze_time('2020-11-01')
+@pytest.mark.asyncio
+async def test_interrupted_signature_detects_filled_placeholder():
+    prep_digest, tbs_document, output = await _prepare_interrupted(MINIMAL)
+    cms_obj = await FROM_CA.async_sign(
+        prep_digest.document_digest,
+        digest_algorithm=tbs_document.md_algorithm,
+    )
+    await PdfTBSDocument.async_finish_signing(output, prep_digest, cms_obj)
+    snapshot = output.getvalue()
+
+    # the document digest still matches, but the placeholder is gone
+    with pytest.raises(
+        PlaceholderAlreadyFilledError, match='already been filled'
+    ):
+        prep_digest.fill_with_cms(output, cms_obj)
+    assert output.getvalue() == snapshot
+
+
+@freeze_time('2020-11-01')
+@pytest.mark.asyncio
+async def test_interrupted_signature_detects_oversized_cms():
+    prep_digest, tbs_document, output = await _prepare_interrupted(MINIMAL)
+    snapshot = output.getvalue()
+    with pytest.raises(SignatureTooLargeError, match='too large'):
+        prep_digest.fill_with_cms(output, b'\x00' * 5000)
+    assert output.getvalue() == snapshot
+
+
+@freeze_time('2020-11-01')
+@pytest.mark.asyncio
+async def test_interrupted_signature_cross_process_recovery(tmp_path):
+    # simulate a cross-process workflow: persist the prepared document and
+    # the prepared digest, then resume from disk in a fresh handle
+    prep_digest, tbs_document, output = await _prepare_interrupted(MINIMAL)
+    cms_obj = await FROM_CA.async_sign(
+        prep_digest.document_digest,
+        digest_algorithm=tbs_document.md_algorithm,
+    )
+
+    pdf_path = tmp_path / 'prepared.pdf'
+    pdf_path.write_bytes(output.getvalue())
+    state_path = tmp_path / 'prepared.pickle'
+    state_path.write_bytes(pickle.dumps(prep_digest))
+
+    # "other process"
+    loaded_prep_digest = pickle.loads(state_path.read_bytes())
+    assert loaded_prep_digest == prep_digest
+    with open(pdf_path, 'r+b') as prepared_file:
+        await PdfTBSDocument.async_finish_signing(
+            prepared_file, loaded_prep_digest, cms_obj
+        )
+
+    with open(pdf_path, 'rb') as signed_file:
+        r = PdfFileReader(signed_file)
+        await async_val_trusted(r.embedded_signatures[0])
 
 
 @pytest.mark.asyncio

@@ -6,6 +6,32 @@ Release history
 pyHanko
 -------
 
+.. _release-0.39.0:
+
+0.39.0
+======
+
+*Release date:* TBD
+
+
+New features and enhancements
+-----------------------------
+
+Signing
+^^^^^^^
+
+ * Guard the interrupted signing workflow against stale or mismatched output:
+   :class:`~pyhanko.sign.signers.pdf_byterange.PreparedByteRangeDigest` now
+   records the digest algorithm, and verifies that the output stream still
+   contains the prepared document and an untouched placeholder region before
+   writing the CMS object. Failures raise
+   :class:`~pyhanko.sign.signers.pdf_byterange.PreparedDocumentMismatchError`,
+   :class:`~pyhanko.sign.signers.pdf_byterange.PlaceholderAlreadyFilledError`
+   or
+   :class:`~pyhanko.sign.signers.pdf_byterange.SignatureTooLargeError`
+   without modifying the output.
+
+
 .. _release-0.38.1:
 
 0.38.1

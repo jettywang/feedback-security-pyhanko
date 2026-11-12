@@ -939,6 +939,22 @@ In other scenarios, you can replace the ``async_finish_signing`` call with the f
 In particular, you don't have to bother with
 :class:`~pyhanko.sign.signers.pdf_signer.PostSignInstructions` at all.
 
+.. note::
+
+    Before anything is written to the output, pyHanko verifies that the
+    document in the output stream still matches the prepared digest, and that
+    the reserved signature placeholder region is still in its original (empty)
+    state. If the output was replaced or modified in the meantime, or if the
+    placeholder region was already filled, a
+    :class:`~pyhanko.sign.signers.pdf_byterange.PreparedDocumentMismatchError`
+    or
+    :class:`~pyhanko.sign.signers.pdf_byterange.PlaceholderAlreadyFilledError`
+    is raised, and the output is left unmodified. This guard is particularly
+    useful when the prepared output is handed off between processes or
+    machines, where files with identical names can be mixed up.
+    You can also invoke the check explicitly using
+    :meth:`~pyhanko.sign.signers.pdf_byterange.PreparedByteRangeDigest.verify`.
+
 
 Interrupted signing when the signer's certificate is not known a priori
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

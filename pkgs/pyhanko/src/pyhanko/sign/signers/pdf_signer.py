@@ -2624,9 +2624,18 @@ class PdfTBSDocument:
             Output stream housing the document in its final pre-signing state.
             This stream must at least be writable and seekable, and also
             readable if post-signature processing is required.
+            Since the prepared digest is verified against the output stream
+            before anything is written, the stream must in fact be readable
+            in all cases.
         :param prepared_digest:
             The prepared digest returned by a prior call to
-            :meth:`digest_tbs_document`.
+            :meth:`digest_tbs_document`. Before the CMS object is written,
+            the digest of the document in the output stream and the reserved
+            signature placeholder region are checked against this prepared
+            digest; if they do not match, a
+            :class:`~.pdf_byterange.PreparedDocumentMismatchError` or
+            :class:`~.pdf_byterange.PlaceholderAlreadyFilledError`
+            is raised and the output stream is left unmodified.
         :param signature_cms:
             CMS object to embed in the signature dictionary.
         :param post_sign_instr:

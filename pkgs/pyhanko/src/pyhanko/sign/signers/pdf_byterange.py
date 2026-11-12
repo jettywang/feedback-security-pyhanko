@@ -4,6 +4,8 @@ around ``/ByteRange`` digests in PDF files.
 """
 
 import binascii
+import hmac
+import os
 from dataclasses import dataclass
 from datetime import datetime
 from io import BytesIO
@@ -30,8 +32,41 @@ __all__ = [
     # Serialisable object used to track placeholder locations,
     # part of PdfCMSEmbedder / PdfSigner protocol
     'PreparedByteRangeDigest',
+    'PreparedDocumentMismatchError',
+    'PlaceholderAlreadyFilledError',
+    'SignatureTooLargeError',
     'SignatureObject',
 ]
+
+
+class PreparedDocumentMismatchError(SigningError):
+    """
+    Raised when the document to which a prepared byte range digest is
+    applied no longer matches the document for which it was prepared.
+    """
+
+
+class PlaceholderAlreadyFilledError(SigningError):
+    """
+    Raised when the reserved signature placeholder region has already been
+    filled, or no longer contains the original empty placeholder.
+    """
+
+
+class SignatureTooLargeError(SigningError):
+    """
+    Raised when a signature container does not fit in the reserved
+    placeholder region.
+    """
+
+
+_MD_ALGORITHMS_BY_DIGEST_LENGTH = {
+    20: 'sha1',
+    28: 'sha224',
+    32: 'sha256',
+    48: 'sha384',
+    64: 'sha512',
+}
 
 
 BYTE_RANGE_ARR_PLACE_HOLDER_LENGTH = 60
@@ -121,6 +156,13 @@ class PreparedByteRangeDigest:
 
         Removed ``md_algorithm`` attribute since it was unused.
 
+    .. versionchanged:: 0.39.0
+
+        Reintroduced ``md_algorithm`` as an optional attribute, and added
+        :meth:`verify` to allow the integrity of the prepared document and
+        its reserved signature placeholder region to be checked before the
+        signature is actually written.
+
     Bookkeeping class that contains the digest of a document that is about to be
     signed (or otherwise authenticated) based on said digest. It also keeps
     track of the region in the output stream that is omitted in the byte range.
@@ -146,18 +188,178 @@ class PreparedByteRangeDigest:
     ``/ByteRange``.
     """
 
-    def fill_with_cms(self, output: IO, cms_data: bytes | cms.ContentInfo):
+    md_algorithm: str | None = None
+    """
+    Message digest algorithm used to compute :attr:`document_digest`.
+    Required to verify the prepared document before filling the reserved
+    region. If omitted, a best-effort guess is made based on the length of
+    :attr:`document_digest`.
+    """
+
+    @property
+    def reserved_region_length(self) -> int:
+        """
+        Length of the reserved region in the output stream, including the
+        hexadecimal string delimiters.
+        """
+        return self.reserved_region_end - self.reserved_region_start
+
+    def _resolve_md_algorithm(self) -> str:
+        if self.md_algorithm is not None:
+            return self.md_algorithm
+        # best-effort fallback for serialised instances that predate the
+        # md_algorithm attribute
+        md_algorithm = _MD_ALGORITHMS_BY_DIGEST_LENGTH.get(
+            len(self.document_digest)
+        )
+        if md_algorithm is None:
+            raise PreparedDocumentMismatchError(
+                "Cannot verify the prepared document: the digest algorithm "
+                "used to compute the document digest is not known, and "
+                "cannot be inferred from the digest length."
+            )
+        return md_algorithm
+
+    def _assert_stream_verifiable(self, output: IO):
+        try:
+            readable = output.readable()
+        except AttributeError:
+            readable = hasattr(output, 'read')
+        if not readable:
+            raise PreparedDocumentMismatchError(
+                "Cannot verify the prepared document: the output stream "
+                "is not readable."
+            )
+        try:
+            seekable = output.seekable()
+        except AttributeError:
+            seekable = hasattr(output, 'seek')
+        if not seekable:
+            raise PreparedDocumentMismatchError(
+                "Cannot verify the prepared document: the output stream "
+                "is not seekable."
+            )
+
+    def _digest_current_output(
+        self, output: IO, chunk_size=misc.DEFAULT_CHUNK_SIZE
+    ) -> bytes:
+        md_spec = get_pyca_cryptography_hash(self._resolve_md_algorithm())
+        md = hashes.Hash(md_spec)
+        start = self.reserved_region_start
+        end = self.reserved_region_end
+        eof = output.seek(0, os.SEEK_END)
+        if start < 0 or end < start or end > eof:
+            raise PreparedDocumentMismatchError(
+                "The output stream is shorter than the prepared document, "
+                "or the reserved signature region is out of bounds; "
+                "the output may have been replaced or truncated."
+            )
+        output.seek(0)
+        misc.chunked_digest(bytearray(chunk_size), output, md, max_read=start)
+        output.seek(end)
+        misc.chunked_digest(
+            bytearray(chunk_size), output, md, max_read=eof - end
+        )
+        return md.finalize()
+
+    def _assert_document_matches(self, output: IO, chunk_size):
+        current_digest = self._digest_current_output(
+            output, chunk_size=chunk_size
+        )
+        if not hmac.compare_digest(current_digest, self.document_digest):
+            raise PreparedDocumentMismatchError(
+                "The digest of the document in the output stream does not "
+                "match the prepared document digest; the output may have "
+                "been replaced or modified since it was prepared for signing."
+            )
+
+    def _assert_placeholder_untouched(self, output: IO):
+        start = self.reserved_region_start
+        end = self.reserved_region_end
+        output.seek(start)
+        region = output.read(end - start)
+        expected = b'<' + b'0' * (end - start - 2) + b'>'
+        if region == expected:
+            return
+        if (
+            len(region) == end - start
+            and region[:1] == b'<'
+            and region[-1:] == b'>'
+            and all(chr(c) in '0123456789abcdefABCDEF' for c in region[1:-1])
+        ):
+            raise PlaceholderAlreadyFilledError(
+                "The reserved signature placeholder region in the output "
+                "stream has already been filled or modified; refusing to "
+                "overwrite it."
+            )
+        raise PreparedDocumentMismatchError(
+            "The reserved signature placeholder region in the output stream "
+            "does not match the original empty placeholder; the output may "
+            "have been replaced or modified since it was prepared for signing."
+        )
+
+    def verify(
+        self,
+        output: IO,
+        *,
+        chunk_size=misc.DEFAULT_CHUNK_SIZE,
+    ):
+        """
+        Verify that the output stream still contains the document for which
+        this prepared digest was computed, and that the reserved signature
+        placeholder region is still in its original (empty) state.
+
+        This method does not modify the output stream.
+
+        :param output:
+            Output stream housing the document in its final pre-signing
+            state. Must be readable and seekable.
+        :param chunk_size:
+            Size of the internal buffer (in bytes) used to feed data to the
+            message digest function.
+        :raises PreparedDocumentMismatchError:
+            If the document in the output stream no longer matches the
+            prepared document.
+        :raises PlaceholderAlreadyFilledError:
+            If the reserved signature placeholder region has already been
+            filled.
+        """
+        self._assert_stream_verifiable(output)
+        orig_pos = output.tell()
+        try:
+            self._assert_document_matches(output, chunk_size)
+            self._assert_placeholder_untouched(output)
+        finally:
+            output.seek(orig_pos)
+
+    def fill_with_cms(
+        self,
+        output: IO,
+        cms_data: bytes | cms.ContentInfo,
+        *,
+        verify: bool = True,
+        chunk_size=misc.DEFAULT_CHUNK_SIZE,
+    ):
         """
         Write a DER-encoded CMS object to the reserved region indicated
         by :attr:`reserved_region_start` and :attr:`reserved_region_end` in the
         output stream.
 
         :param output:
-            Output stream to use. Must be writable and seekable.
+            Output stream to use. Must be writable and seekable, and also
+            readable if ``verify`` is ``True``.
         :param cms_data:
             CMS object to write. Can be provided as an
             :class:`asn1crypto.cms.ContentInfo` object, or as raw DER-encoded
             bytes.
+        :param verify:
+            Verify that the output stream still contains the document for
+            which this prepared digest was computed, and that the reserved
+            region has not been filled yet, before writing anything.
+            Default is ``True``.
+        :param chunk_size:
+            Size of the internal buffer (in bytes) used to feed data to the
+            message digest function when verifying.
         :return:
             A :class:`bytes` object containing the contents that were written,
             plus any additional padding.
@@ -166,19 +368,37 @@ class PreparedByteRangeDigest:
             der_bytes = cms_data
         else:
             der_bytes = cms_data.dump()
-        return self.fill_reserved_region(output, der_bytes)
+        return self.fill_reserved_region(
+            output, der_bytes, verify=verify, chunk_size=chunk_size
+        )
 
-    def fill_reserved_region(self, output: IO, content_bytes: bytes):
+    def fill_reserved_region(
+        self,
+        output: IO,
+        content_bytes: bytes,
+        *,
+        verify: bool = True,
+        chunk_size=misc.DEFAULT_CHUNK_SIZE,
+    ):
         """
         Write hex-encoded contents to the reserved region indicated
         by :attr:`reserved_region_start` and :attr:`reserved_region_end` in the
         output stream.
 
         :param output:
-            Output stream to use. Must be writable and seekable.
+            Output stream to use. Must be writable and seekable, and also
+            readable if ``verify`` is ``True``.
         :param content_bytes:
             Content bytes. These will be padded, hexadecimally encoded and
             written to the appropriate location in output stream.
+        :param verify:
+            Verify that the output stream still contains the document for
+            which this prepared digest was computed, and that the reserved
+            region has not been filled yet, before writing anything.
+            Default is ``True``.
+        :param chunk_size:
+            Size of the internal buffer (in bytes) used to feed data to the
+            message digest function when verifying.
         :return:
             A :class:`bytes` object containing the contents that were written,
             plus any additional padding.
@@ -191,11 +411,15 @@ class PreparedByteRangeDigest:
         bytes_reserved = end - start - 2
         length = len(content_hex)
         if length > bytes_reserved:
-            raise SigningError(
+            raise SignatureTooLargeError(
                 f"Final ByteRange payload larger than expected: "
                 f"allocated {bytes_reserved} bytes, but contents "
-                f"required {length} bytes."
-            )  # pragma: nocover
+                f"required {length} bytes; the signature is too large "
+                f"for the reserved placeholder region."
+            )
+
+        if verify:
+            self.verify(output, chunk_size=chunk_size)
 
         # +1 to skip the '<'
         output.seek(start + 1)
@@ -321,6 +545,7 @@ class PdfByteRangeDigest(generic.DictionaryObject):
             document_digest=digest_value,
             reserved_region_start=sig_start,
             reserved_region_end=sig_end,
+            md_algorithm=md_algorithm,
         )
         cms_data = yield prepared_br_digest, output
         yield prepared_br_digest.fill_with_cms(output, cms_data)
