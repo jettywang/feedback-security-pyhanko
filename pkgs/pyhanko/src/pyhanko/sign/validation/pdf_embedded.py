@@ -7,6 +7,7 @@ from asn1crypto import cms, x509
 from pyhanko.pdf_utils import generic, misc
 from pyhanko.pdf_utils.generic import pdf_name
 from pyhanko.pdf_utils.reader import PdfFileReader, process_data_at_eof
+from pyhanko.pdf_utils.xref import read_object_header
 from pyhanko.sign.diff_analysis import (
     DEFAULT_DIFF_POLICY,
     DiffPolicy,
@@ -201,6 +202,7 @@ class EmbeddedPdfSignature:
         self.signed_revision = self.reader.xrefs.get_last_change(
             sig_object_ref.reference
         )
+        self.sig_object_ref = sig_object_ref.reference
         self.coverage = None
         self.external_digests: dict[str, bytes] = {}
         self._docmdp: MDPPerm | None = None
@@ -435,6 +437,55 @@ class EmbeddedPdfSignature:
         self.external_digests[digest_algorithm] = digest
         return digest
 
+    def _contents_value_span(self) -> tuple[int, int] | None:
+        """
+        Locate the raw byte span occupied by the ``/Contents`` value in the
+        signature dictionary, as stored in the signed revision of the
+        document.
+
+        :return:
+            A ``(start, end)`` tuple of byte offsets, or ``None`` if the span
+            could not be determined unambiguously.
+        """
+        reader = self.reader
+        sig_ref = self.sig_object_ref
+        marker = reader.xrefs.get_historical_ref(sig_ref, self.signed_revision)
+        if not isinstance(marker, int):
+            # The signature dictionary is not available as a regular
+            # indirect object (e.g. it lives in an object stream), so we
+            # cannot verify the raw layout of the signature dictionary.
+            return None
+        stream = reader.stream
+        try:
+            stream.seek(marker)
+            idnum, generation = read_object_header(stream, strict=False)
+            if (idnum, generation) != (sig_ref.idnum, sig_ref.generation):
+                return None
+            if stream.read(2) != b'<<':
+                return None
+            span = None
+            while True:
+                tok = misc.read_non_whitespace(stream)
+                if tok == b'>':
+                    if stream.read(1) != b'>':
+                        return None
+                    break
+                if tok != b'/':
+                    return None
+                stream.seek(-1, os.SEEK_CUR)
+                key = generic.NameObject.read_from_stream(stream)
+                misc.read_non_whitespace(stream, seek_back=True)
+                value_start = stream.tell()
+                generic.read_object(stream, sig_ref)
+                value_end = stream.tell()
+                # mirror DictionaryObject.read_from_stream:
+                # the first occurrence of a key wins
+                if key == '/Contents' and span is None:
+                    span = (value_start, value_end)
+            return span
+        except (misc.PdfError, ValueError, TypeError, OSError):
+            return None
+
     def evaluate_signature_coverage(self) -> SignatureCoverageLevel:
         """
         Internal method used to evaluate the coverage level of a signature.
@@ -454,6 +505,16 @@ class EmbeddedPdfSignature:
 
         _, len1, start2, len2 = self.byte_range
 
+        # The gap in the byte range must correspond exactly to the
+        # ``/Contents`` value in the signature dictionary. If it doesn't,
+        # the uncovered region might hide arbitrary modifiable content,
+        # so the signature cannot be said to cover its revision (let alone
+        # the entire file).
+        contents_span = self._contents_value_span()
+        gap_matches_contents = (
+            contents_span is not None and (len1, start2) == contents_span
+        )
+
         # first check: check if the signature covers the entire file.
         #  (from a cryptographic point of view)
         # In this case, there are no changes at all, so we're good.
@@ -466,7 +527,10 @@ class EmbeddedPdfSignature:
         signed_zone_len = len1 + len2 + embedded_sig_content
         file_covered = stream.tell() == signed_zone_len
         if file_covered:
-            return SignatureCoverageLevel.ENTIRE_FILE
+            if gap_matches_contents:
+                return SignatureCoverageLevel.ENTIRE_FILE
+            else:
+                return SignatureCoverageLevel.UNCLEAR
 
         # Now we're in the mixed case: the byte range is a standard one
         #  starting at the beginning of the document, but it doesn't go all
@@ -505,7 +569,10 @@ class EmbeddedPdfSignature:
             if xref_meta.end_location > signed_zone_len:
                 return SignatureCoverageLevel.CONTIGUOUS_BLOCK_FROM_START
 
-        return SignatureCoverageLevel.ENTIRE_REVISION
+        if gap_matches_contents:
+            return SignatureCoverageLevel.ENTIRE_REVISION
+        else:
+            return SignatureCoverageLevel.UNCLEAR
 
     def _enforce_hybrid_xref_policy(self):
         reader = self.reader
