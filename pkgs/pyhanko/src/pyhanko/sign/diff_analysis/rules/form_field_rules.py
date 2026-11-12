@@ -615,25 +615,26 @@ class SigFieldModificationRule(BaseFieldModificationRule):
                     ModificationLevel.LTA_UPDATES, field_ref_updates
                 )
 
-                # whitelist appearance updates at FORM_FILL level
-                yield from qualify_transforming(
-                    ModificationLevel.FORM_FILLING,
-                    _allow_appearance_update(
-                        old_field, new_field, context.old, context.new
-                    ),
-                    transform=FormUpdate.curry_ref(field_name=fq_name),
-                )
-                if self.allow_in_place_appearance_stream_changes:
-                    yield from qualify(
+                if _field_appearance_changed(old_field, new_field):
+                    # whitelist appearance updates at FORM_FILL level
+                    yield from qualify_transforming(
                         ModificationLevel.FORM_FILLING,
-                        _allow_in_place_appearance_update(
-                            old_field,
-                            new_field,
-                            context.old,
-                            context.new,
-                            fq_name=fq_name,
+                        _allow_appearance_update(
+                            old_field, new_field, context.old, context.new
                         ),
+                        transform=FormUpdate.curry_ref(field_name=fq_name),
                     )
+                    if self.allow_in_place_appearance_stream_changes:
+                        yield from qualify(
+                            ModificationLevel.FORM_FILLING,
+                            _allow_in_place_appearance_update(
+                                old_field,
+                                new_field,
+                                context.old,
+                                context.new,
+                                fq_name=fq_name,
+                            ),
+                        )
             else:
                 # case where the field was already signed, or is still
                 # not signed in the current revision.
@@ -764,24 +765,25 @@ class GenericFieldModificationRule(BaseFieldModificationRule):
         new_field = spec.new_field
         # we already checked this further up
         assert old_field and new_field
-        yield from qualify_transforming(
-            ModificationLevel.FORM_FILLING,
-            _allow_appearance_update(
-                old_field, new_field, context.old, context.new
-            ),
-            transform=FormUpdate.curry_ref(field_name=fq_name),
-        )
-        if self.allow_in_place_appearance_stream_changes:
-            yield from qualify(
+        if _field_appearance_changed(old_field, new_field):
+            yield from qualify_transforming(
                 ModificationLevel.FORM_FILLING,
-                _allow_in_place_appearance_update(
-                    old_field,
-                    new_field,
-                    context.old,
-                    context.new,
-                    fq_name=fq_name,
+                _allow_appearance_update(
+                    old_field, new_field, context.old, context.new
                 ),
+                transform=FormUpdate.curry_ref(field_name=fq_name),
             )
+            if self.allow_in_place_appearance_stream_changes:
+                yield from qualify(
+                    ModificationLevel.FORM_FILLING,
+                    _allow_in_place_appearance_update(
+                        old_field,
+                        new_field,
+                        context.old,
+                        context.new,
+                        fq_name=fq_name,
+                    ),
+                )
         try:
             new_value = new_field.raw_get('/V')
         except KeyError:
@@ -803,6 +805,90 @@ class GenericFieldModificationRule(BaseFieldModificationRule):
                 misc._as_gen(deps),
                 transform=FormUpdate.curry_ref(field_name=fq_name),
             )
+
+
+def _appearance_stream_signature(ap_dict):
+    refs = {}
+    for key in ('/N', '/R', '/D'):
+        try:
+            entry = ap_dict.raw_get(key)
+        except KeyError:
+            continue
+        if isinstance(entry, generic.IndirectObject):
+            refs[key] = ('ref', entry.reference, entry.get_object())
+        else:
+            refs[key] = ('direct', None, entry)
+    return frozenset(
+        (key, kind, ref) for key, (kind, ref, _obj) in refs.items()
+    ), refs
+
+
+def _field_appearance_changed(old_field, new_field) -> bool:
+    """
+    Determine whether the appearance configuration of a field was modified.
+
+    The appearance update rules must only run for fields whose /AP entry
+    actually changed. Indirect appearance dictionaries and appearance
+    streams can be shared between several fields, so unconditionally
+    whitelisting a field's appearance objects would produce
+    :class:`.FormUpdate` objects for fields that weren't touched at all,
+    which in turn causes false positives when those fields are locked.
+
+    The comparison is structural: merely replacing an appearance stream
+    object in place (same reference, different content) also counts as a
+    change, whereas two untouched fields sharing the same indirect /AP
+    dictionary compare equal and are skipped.
+    """
+    try:
+        old_ap = old_field.raw_get('/AP')
+    except KeyError:
+        old_ap = None
+    try:
+        new_ap = new_field.raw_get('/AP')
+    except KeyError:
+        new_ap = None
+
+    if old_ap is None or new_ap is None:
+        return old_ap is not new_ap
+
+    old_ap_ref = (
+        old_ap.reference if isinstance(old_ap, generic.IndirectObject) else None
+    )
+    new_ap_ref = (
+        new_ap.reference if isinstance(new_ap, generic.IndirectObject) else None
+    )
+    # A change between direct and indirect /AP entries (or between two
+    # distinct indirect /AP dictionaries) is a structural change.
+    if old_ap_ref != new_ap_ref:
+        return True
+
+    old_ap_dict = old_ap.get_object()
+    new_ap_dict = new_ap.get_object()
+    if not isinstance(old_ap_dict, generic.DictionaryObject) or not isinstance(
+        new_ap_dict, generic.DictionaryObject
+    ):
+        return True
+
+    # Compare the set of /N, /R, /D entries first, then dereference each
+    # appearance stream and compare its content, so that in-place stream
+    # overrides (same ref, different bytes) are still detected even when the
+    # /AP dictionary itself is a shared indirect object.
+    old_sig, old_streams = _appearance_stream_signature(old_ap_dict)
+    new_sig, new_streams = _appearance_stream_signature(new_ap_dict)
+    if old_sig != new_sig:
+        return True
+
+    # Import locally to avoid a circular import with the policy module.
+    from ..policies import _is_id
+
+    for key, (_kind, _ref, old_obj) in old_streams.items():
+        new_obj = new_streams[key][2]
+        try:
+            if not _is_id(old_obj, new_obj):
+                return True
+        except NotImplementedError:
+            return True
+    return False
 
 
 def _allow_appearance_update(

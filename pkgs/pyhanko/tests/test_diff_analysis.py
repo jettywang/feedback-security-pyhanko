@@ -1247,6 +1247,274 @@ def test_form_field_in_group_locked_postsign_modify_success(
     val_trusted(s, extd=True)
 
 
+def _make_same_named_leaf_form(ap_mode):
+    """
+    Build a form with two non-signature parent fields (``A`` and ``B``),
+    each containing a terminal text widget that has the same leaf name
+    (``Status``), giving the fully qualified names ``A.Status`` and
+    ``B.Status``.
+
+    :param ap_mode:
+        * ``independent``: distinct /AP dictionaries and distinct streams;
+        * ``shared_ap``: both widgets share one indirect /AP dictionary;
+        * ``shared_stream``: distinct /AP dictionaries whose /N entries
+          point at the same appearance stream.
+    """
+    w = IncrementalPdfFileWriter(BytesIO(SIMPLE_FORM))
+    acro = w.root['/AcroForm']
+    page = w.root['/Pages']['/Kids'][0]
+    shared_stream = w.add_object(
+        RawContent(
+            box=BoxConstraints(height=60, width=130),
+            data=b'q 0 0 1 rg BT /Ti 12 Tf (initial) Tj ET Q',
+        ).as_form_xobject()
+    )
+    shared_ap = w.add_object(
+        generic.DictionaryObject({generic.pdf_name('/N'): shared_stream})
+    )
+
+    def _make_leaf(parent_ref, stream_ref):
+        ap_dict = w.add_object(
+            generic.DictionaryObject({generic.pdf_name('/N'): stream_ref})
+        )
+        leaf = generic.DictionaryObject(
+            {
+                generic.pdf_name('/Type'): generic.pdf_name('/Annot'),
+                generic.pdf_name('/Subtype'): generic.pdf_name('/Widget'),
+                generic.pdf_name('/Rect'): generic.ArrayObject(
+                    map(generic.NumberObject, (72, 700, 202, 760))
+                ),
+                generic.pdf_name('/F'): generic.NumberObject(4),
+                generic.pdf_name('/T'): generic.pdf_string('Status'),
+                generic.pdf_name('/FT'): generic.pdf_name('/Tx'),
+                generic.pdf_name('/DA'): generic.pdf_string('/Helv 0 Tf 0 g'),
+                generic.pdf_name('/P'): page,
+                generic.pdf_name('/Parent'): parent_ref,
+                generic.pdf_name('/AP'): generic.IndirectObject(
+                    ap_dict.idnum, 0, w
+                ),
+            }
+        )
+        return w.add_object(leaf)
+
+    leaf_ids = []
+    parent_refs = []
+    for name, stream_ref in (
+        ('A', shared_stream),
+        (
+            'B',
+            shared_stream
+            if ap_mode in ('shared_ap', 'shared_stream')
+            else w.add_object(
+                RawContent(
+                    box=BoxConstraints(height=60, width=130),
+                    data=b'q 0 0 1 rg BT /Ti 12 Tf (initial-b) Tj ET Q',
+                ).as_form_xobject()
+            ),
+        ),
+    ):
+        parent_ref = w.add_object(
+            generic.DictionaryObject(
+                {
+                    generic.pdf_name('/T'): generic.pdf_string(name),
+                    generic.pdf_name('/FT'): generic.pdf_name('/Tx'),
+                }
+            )
+        )
+        leaf_ref = _make_leaf(parent_ref, stream_ref)
+        parent = parent_ref.get_object()
+        parent['/Kids'] = generic.ArrayObject([leaf_ref])
+        w.update_container(parent)
+        if ap_mode == 'shared_ap':
+            leaf = leaf_ref.get_object()
+            leaf['/AP'] = generic.IndirectObject(shared_ap.idnum, 0, w)
+            w.update_container(leaf)
+        parent_refs.append(parent_ref)
+        leaf_ids.append(leaf_ref.idnum)
+
+    for parent_ref in parent_refs:
+        acro['/Fields'].append(parent_ref)
+    w.update_container(acro)
+    out = BytesIO()
+    w.write(out)
+    return out, leaf_ids
+
+
+def _certify_form_with_field_lock(out, fieldmdp):
+    w = IncrementalPdfFileWriter(out)
+    sp = fields.SigFieldSpec(
+        'SigCert',
+        box=(10, 74, 140, 134),
+        field_mdp_spec=fieldmdp,
+        doc_mdp_update_value=fields.MDPPerm.FILL_FORMS,
+    )
+    fields.append_signature_field(w, sp)
+    return signers.sign_pdf(
+        w,
+        signers.PdfSignatureMetadata(field_name='SigCert'),
+        signer=FROM_CA,
+    )
+
+
+def _fill_same_named_leaf(out, leaf_id, value):
+    w = IncrementalPdfFileWriter(out)
+    target = None
+    for fld in w.root['/AcroForm']['/Fields']:
+        field_dict = fld.get_object()
+        if '/Kids' not in field_dict:
+            continue
+        for kid in field_dict['/Kids']:
+            if kid.reference.idnum == leaf_id:
+                target = kid.get_object()
+    assert target is not None
+    new_stream = w.add_object(
+        RawContent(
+            box=BoxConstraints(height=60, width=130),
+            data=b'q 0 0 1 rg BT /Ti 12 Tf (%s) Tj ET Q'
+            % value.encode('ascii'),
+        ).as_form_xobject()
+    )
+    target['/V'] = generic.pdf_string(value)
+    target['/AP'] = generic.DictionaryObject(
+        {generic.pdf_name('/N'): new_stream}
+    )
+    w.update_container(target)
+    result = BytesIO()
+    w.write(result)
+    return result
+
+
+@freeze_time('2020-11-01')
+@pytest.mark.parametrize(
+    'ap_mode',
+    ['independent', 'shared_stream'],
+)
+def test_locked_sibling_field_not_flagged_on_legal_fill(ap_mode):
+    # Regression test: filling an unlocked field must not be rejected merely
+    # because the appearance rule used to emit whitelist entries for *all*
+    # fields, including untouched locked ones sharing appearance objects.
+    # A genuinely shared indirect /AP dictionary is covered separately, since
+    # re-pointing one of its users cannot be attributed to a single field.
+    out, (id_a, _id_b) = _make_same_named_leaf_form(ap_mode)
+    fieldmdp = fields.FieldMDPSpec(
+        fields.FieldMDPAction.INCLUDE, fields=['B.Status']
+    )
+    signed = _certify_form_with_field_lock(out, fieldmdp)
+    updated = _fill_same_named_leaf(signed, id_a, 'filled-a')
+
+    r = PdfFileReader(updated)
+    status = validate_pdf_signature(
+        r.embedded_signatures[0], simple_v_context()
+    )
+    assert status.docmdp_ok
+    assert status.bottom_line
+    assert status.modification_level == ModificationLevel.FORM_FILLING
+    assert status.diff_result.changed_form_fields == {'A.Status'}
+
+
+@freeze_time('2020-11-01')
+def test_locked_field_fill_rejected_with_all_lock():
+    # With a FieldMDP /All policy, filling A.Status must still be rejected.
+    out, (id_a, _id_b) = _make_same_named_leaf_form('independent')
+    fieldmdp = fields.FieldMDPSpec(fields.FieldMDPAction.ALL)
+    signed = _certify_form_with_field_lock(out, fieldmdp)
+    updated = _fill_same_named_leaf(signed, id_a, 'filled-a')
+
+    r = PdfFileReader(updated)
+    status = validate_pdf_signature(
+        r.embedded_signatures[0], simple_v_context()
+    )
+    assert not status.docmdp_ok
+    assert not status.bottom_line
+    assert 'A.Status is locked' in str(status.diff_result)
+
+
+@freeze_time('2020-11-01')
+def test_shared_ap_dict_modification_still_rejected():
+    # Re-pointing one of two widgets that share an *indirect* /AP dictionary
+    # remains forbidden: the shared dictionary is used in multiple contexts.
+    out, (id_a, _id_b) = _make_same_named_leaf_form('shared_ap')
+    fieldmdp = fields.FieldMDPSpec(
+        fields.FieldMDPAction.INCLUDE, fields=['B.Status']
+    )
+    signed = _certify_form_with_field_lock(out, fieldmdp)
+    updated = _fill_same_named_leaf(signed, id_a, 'filled-a')
+
+    r = PdfFileReader(updated)
+    status = validate_pdf_signature(
+        r.embedded_signatures[0], simple_v_context()
+    )
+    assert not status.docmdp_ok
+    assert 'used in multiple contexts' in str(status.diff_result)
+
+
+@freeze_time('2020-11-01')
+def test_shared_appearance_stream_in_place_override_attributed_to_locked_field():
+    # Rewriting the shared appearance stream object in place changes the
+    # display of the locked B.Status widget as well; the relative-context
+    # reconciliation must leave the locked usage unexplained and reject it.
+    out, (_id_a, id_b) = _make_same_named_leaf_form('shared_stream')
+    fieldmdp = fields.FieldMDPSpec(
+        fields.FieldMDPAction.INCLUDE, fields=['B.Status']
+    )
+    signed = _certify_form_with_field_lock(out, fieldmdp)
+
+    w = IncrementalPdfFileWriter(signed)
+    shared_stream_ref = None
+    for fld in w.root['/AcroForm']['/Fields']:
+        field_dict = fld.get_object()
+        if '/Kids' not in field_dict:
+            continue
+        for kid in field_dict['/Kids']:
+            leaf = kid.get_object()
+            stream_ref = leaf['/AP'].get_object().get_value_as_reference('/N')
+            if kid.reference.idnum == id_b:
+                shared_stream_ref = stream_ref
+    assert shared_stream_ref is not None
+    stream = shared_stream_ref.get_object()
+    stream._data = b'q 1 0 0 rg BT /Ti 12 Tf (evil) Tj ET Q'
+    stream._encoded_data = None
+    w.update_container(stream)
+    result = BytesIO()
+    w.write(result)
+
+    r = PdfFileReader(result)
+    status = validate_pdf_signature(
+        r.embedded_signatures[0], simple_v_context()
+    )
+    assert not status.docmdp_ok
+    assert not status.bottom_line
+    assert 'B.Status is locked' in str(status.diff_result)
+
+
+@freeze_time('2020-11-01')
+def test_legal_fill_without_field_mdp_under_docmdp():
+    # Without a FieldMDP policy, a legal form fill is accepted under the
+    # DocMDP FILL_FORMS permission even when fields share an appearance.
+    out, (id_a, _id_b) = _make_same_named_leaf_form('shared_stream')
+    w = IncrementalPdfFileWriter(out)
+    sp = fields.SigFieldSpec(
+        'SigCert',
+        box=(10, 74, 140, 134),
+        doc_mdp_update_value=fields.MDPPerm.FILL_FORMS,
+    )
+    fields.append_signature_field(w, sp)
+    signed = signers.sign_pdf(
+        w,
+        signers.PdfSignatureMetadata(field_name='SigCert'),
+        signer=FROM_CA,
+    )
+    updated = _fill_same_named_leaf(signed, id_a, 'filled-a')
+
+    r = PdfFileReader(updated)
+    status = validate_pdf_signature(
+        r.embedded_signatures[0], simple_v_context()
+    )
+    assert status.docmdp_ok
+    assert status.bottom_line
+    assert status.modification_level == ModificationLevel.FORM_FILLING
+
+
 @freeze_time('2020-11-01')
 def test_form_field_postsign_fill_pades_lt(pki_services):
     w = IncrementalPdfFileWriter(BytesIO(SIMPLE_FORM))
