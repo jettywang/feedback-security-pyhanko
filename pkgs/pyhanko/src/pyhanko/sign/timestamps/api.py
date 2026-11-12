@@ -182,4 +182,6 @@ class TimeStamper:
 
         nonce, req = self.request_cms(message_digest, md_algorithm)
         res = await self.async_request_tsa_response(req)
-        return handle_tsp_response(res, nonce)
+        return handle_tsp_response(
+            res, nonce, expected_message_imprint=req['message_imprint']
+        )

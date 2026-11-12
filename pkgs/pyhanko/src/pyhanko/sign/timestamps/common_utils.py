@@ -53,7 +53,9 @@ def dummy_digest(md_algorithm: str) -> bytes:
 
 
 def handle_tsp_response(
-    response: tsp.TimeStampResp, nonce: bytes | None
+    response: tsp.TimeStampResp,
+    nonce: int | bytes | None,
+    expected_message_imprint: tsp.MessageImprint | None = None,
 ) -> cms.ContentInfo:
     pki_status_info = response['status']
     if pki_status_info['status'].native != 'granted':
@@ -66,13 +68,38 @@ def handle_tsp_response(
             f'"{status_string}", failInfo "{fail_info}"'
         )
     tst = response['time_stamp_token']
-    tst_info = tst['content']['encap_content_info']['content']
-    nonce_received = tst_info.parsed['nonce'].native
+    tst_info = tst['content']['encap_content_info']['content'].parsed
+    nonce_received = tst_info['nonce'].native
     if nonce is not None and nonce_received != nonce:
+        expected_nonce = (
+            hex(nonce) if isinstance(nonce, int) else nonce.hex()
+        )
         raise TimestampRequestError(
             f'Time stamping authority sent back bad nonce value. Expected '
-            f'{nonce.hex()}, but got {hex(nonce_received)}.'
+            f'{expected_nonce}, but got {hex(nonce_received)}.'
         )
+    if expected_message_imprint is not None:
+        actual_message_imprint = tst_info['message_imprint']
+        actual_algorithm = actual_message_imprint['hash_algorithm'][
+            'algorithm'
+        ].native
+        expected_algorithm = expected_message_imprint['hash_algorithm'][
+            'algorithm'
+        ].native
+        if actual_algorithm != expected_algorithm:
+            raise TimestampRequestError(
+                'Time stamping authority answered with the wrong message '
+                f'imprint digest algorithm. Expected {expected_algorithm}, '
+                f'but got {actual_algorithm}.'
+            )
+        actual_digest = actual_message_imprint['hashed_message'].native
+        expected_digest = expected_message_imprint['hashed_message'].native
+        if actual_digest != expected_digest:
+            raise TimestampRequestError(
+                'Time stamping authority answered with a timestamp for a '
+                'different message. Expected message imprint '
+                f'{expected_digest.hex()}, but got {actual_digest.hex()}.'
+            )
     return tst
 
 
